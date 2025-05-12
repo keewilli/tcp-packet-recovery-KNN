@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""
+event_logger.py - Module for logging packet events to a database
+
+This module provides functionality to log packet-related events such as
+missing packets and packet injections to a database for later analysis.
+"""
+
+import time
+import threading
+import logging
+import json
+from datetime import datetime
+from typing import Dict, List, Optional, Any, Union
+
+import sqlalchemy as sa
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.exc import SQLAlchemyError
+
+logger = logging.getLogger(__name__)
+
+# Define SQLAlchemy Base
+Base = declarative_base()
+
+# Define database models
+class PacketEvent(Base):
+    """SQLAlchemy model for packet events."""
+    
+    __tablename__ = 'packet_events'
+    
+    id = sa.Column(sa.Integer, primary_key=True)
+    timestamp = sa.Column(sa.DateTime, default=datetime.utcnow)
+    stream_id = sa.Column(sa.String(100), index=True)
+    event_type = sa.Column(sa.String(50), index=True)
+    sequence_number = sa.Column(sa.BigInteger, nullable=True)
+    source_ip = sa.Column(sa.String(50), nullable=True)
+    destination_ip = sa.Column(sa.String(50), nullable=True)
+    source_port = sa.Column(sa.Integer, nullable=True)
+    destination_port = sa.Column(sa.Integer, nullable=True)
+    payload_size = sa.Column(sa.Integer, nullable=True)
+    metadata = sa.Column(sa.Text, nullable=True)  # JSON-encoded metadata
+    
+    def __repr__(self):
+        return f"<PacketEvent(id={self.id}, timestamp={self.timestamp}, type={self.event_type})>"
+
+class StreamStats(Base):
+    """SQLAlchemy model for stream statistics."""
+    
+    __tablename__ = 'stream_stats'
+    
+    id = sa.Column(sa.Integer, primary_key=True)
+    timestamp = sa.Column(sa.DateTime, default=datetime.utcnow)
+    stream_id = sa.Column(sa.String(100), index=True)
+    total_packets = sa.Column(sa.Integer, default=0)
+    missing_packets = sa.Column(sa.Integer, default=0)
+    injected_packets = sa.Column(sa.Integer, default=0)
+    packet_loss_rate = sa.Column(sa.Float, default=0.0)
+    average_payload_size = sa.Column(sa.Float, default=0.0)
+    metadata = sa.Column(sa.Text, nullable=True)  # JSON-encoded metadata
+    
+    def __repr__(self):
+        return f"<StreamStats(id={self.id}, stream_id={self.stream_id}, loss_rate={self.packet_loss_rate:.2f})>"
+
+class EventLogger:
+    """Logs packet events to a database."""
+    
+    def __init__(self, db_url: str, echo: bool = False, auto_flush_interval: float = 5.0):
+        """
+        Initialize the event logger.
+        
+        Args:
+            db_url: SQLAlchemy database URL
+            echo: Whether to echo SQL statements
+            auto_flush_interval: How often to automatically flush events (in seconds)
+        """
+        self.db_url = db_url
+        self.echo = echo
+        self.auto_flush_interval = auto_flush_interval
+        self.engine = None
+        self.session_factory = None
+        self.Session = None
+        self.event_queue = []
+        self.queue_lock = threading.Lock()
+        self.flush_thread = None
+        self.running = False
+    
+    def connect(self):
+        """Connect to the database and create tables if they don't exist."""
+        try:
+            # Create engine
+            self.engine = sa.create_engine(self.db_url, echo=self.echo)
+            
+            # Create session factory
+            self.session_factory = sessionmaker(bind=self.engine)
+            self.Session = scoped_session(self.session_factory)
+            
+            # Create tables
+            Base.metadata.create_all(self.engine)
+            
+            logger.info(f"Connected to database at {self.db_url}")
+            return True
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to connect to database: {e}")
+            return False
+    
+    def _auto_flush_thread(self):
+        """Thread function for automatic flushing of events."""
+        while self.running:
+            time.sleep(self.auto_flush_interval)
+            self.flush_events()
+    
+    def start_auto_flush(self):
+        """Start the automatic flush thread."""
+        if self.running:
+            return
+        
+        self.running = True
+        self.flush_thread = threading.Thread(target=self._auto_flush_thread)
+        self.flush_thread.daemon = True
+        self.flush_thread.start()
+    
+    def stop_auto_flush(self):
+        """Stop the automatic flush thread."""
+        self.running = False
+        if self.flush_thread:
+            self.flush_thread.join(timeout=2.0)
+    
+    def log_event(self, 
+                event_type: str, 
+                stream_id: str, 
+                sequence_number: Optional[int] = None,
+                source_ip: Optional[str] = None,
+                destination_ip: Optional[str] = None,
+                source_port: Optional[int] = None,
+                destination_port: Optional[int] = None,
+                payload_size: Optional[int] = None,
+                metadata: Optional[Dict] = None):
+        """
+        Log a packet event.
+        
+        Args:
+            event_type: Type of event (e.g., 'missing_packet', 'injection')
+            stream_id: Stream identifier
+            sequence_number: TCP sequence number
+            source_ip: Source IP address
+            destination_ip: Destination IP address
+            source_port: Source port
+            destination_port: Destination port
+            payload_size: Size of the packet payload
+            metadata: Additional metadata
+        """
+        event = {
+            'event_type': event_type,
+            'stream_id': stream_id,
+            'sequence_number': sequence_number,
+            'source_ip': source_ip,
+            'destination_ip': destination_ip,
+            'source_port': source_port,
+            'destination_port': destination_port,
+            'payload_size': payload_size,
+            'metadata': json.dumps(metadata) if metadata else None,
+            'timestamp': datetime.utcnow()
+        }
+        
+        with self.queue_lock:
+            self.event_queue.append(('event', event))
+    
+    def log_stream_stats(self,
+                       stream_id: str,
+                       total_packets: int,
+                       missing_packets: int,
+                       injected_packets: int,
+                       packet_loss_rate: float,
+                       average_payload_size: float,
+                       metadata: Optional[Dict] = None):
+        """
+        Log stream statistics.
+        
+        Args:
+            stream_id: Stream identifier
+            total_packets: Total number of packets in the stream
+            missing_packets: Number of missing packets
+            injected_packets: Number of injected packets
+            packet_loss_rate: Packet loss rate (0.0-1.0)
+            average_payload_size: Average payload size in bytes
+            metadata: Additional metadata
+        """
+        stats = {
+            'stream_id': stream_id,
+            'total_packets': total_packets,
+            'missing_packets': missing_packets,
+            'injected_packets': injected_packets,
+            'packet_loss_rate': packet_loss_rate,
+            'average_payload_size': average_payload_size,
+            'metadata': json.dumps(metadata) if metadata else None,
+            'timestamp': datetime.utcnow()
+        }
+        
+        with self.queue_lock:
+            self.event_queue.append(('stats', stats))
+    
+    def flush_events(self):
+        """Flush queued events to the database."""
+        with self.queue_lock:
+            if not self.event_queue:
+                return
+            
+            queue_copy = self.event_queue.copy()
+            self.event_queue.clear()
+        
+        if not self.engine or not self.Session:
+            logger.error("Cannot flush events: not connected to database")
+            return
+        
+        session = self.Session()
+        try:
+            for entry_type, entry_data in queue_copy:
+                if entry_type == 'event':
+                    event = PacketEvent(**entry_data)
+                    session.add(event)
+                elif entry_type == 'stats':
+                    stats = StreamStats(**entry_data)
+                    session.add(stats)
+            
+            session.commit()
+            logger.debug(f"Flushed {len(queue_copy)} events to database")
+            return True
+        except SQLAlchemyError as e:
+            session.rollback()
+            logger.error(f"Failed to flush events to database: {e}")
+            return False
+        finally:
+            session.close()
+    
+    def get_stream_stats(self, stream_id: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        """
+        Get stream statistics from the database.
+        
+        Args:
+            stream_id: Stream identifier or None for all streams
+            limit: Maximum number of records to return
+            
+        Returns:
+            List[Dict]: Stream statistics
+        """
+        if not self.engine or not self.Session:
+            logger.error("Cannot get stream stats: not connected to database")
+            return []
+        
+        session = self.Session()
+        try:
+            query = session.query(StreamStats).order_by(StreamStats.timestamp.desc())
+            
+            if stream_id:
+                query = query.filter(StreamStats.stream_id == stream_id)
+            
+            stats = query.limit(limit).all()
+            
+            result = []
+            for stat in stats:
+                stat_dict = {
+                    'id': stat.id,
+                    'timestamp': stat.timestamp.isoformat(),
+                    'stream_id': stat.stream_id,
+                    'total_packets': stat.total_packets,
+                    'missing_packets': stat.missing_packets,
+                    'injected_packets': stat.injected_packets,
+                    'packet_loss_rate': stat.packet_loss_rate,
+                    'average_payload_size': stat.average_payload_size,
+                    'metadata': json.loads(stat.metadata) if stat.metadata else None
+                }
+                result.append(stat_dict)
+            
+            return result
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to get stream stats: {e}")
+            return []
+        finally:
+            session.close()
+    
+    def get_events_by_type(self, event_type: str, limit: int = 100) -> List[Dict]:
+        """
+        Get events of a specific type from the database.
+        
+        Args:
+            event_type: Type of events to retrieve
+            limit: Maximum number of records to return
+            
+        Returns:
+            List[Dict]: Events
+        """
+        if not self.engine or not self.Session:
+            logger.error("Cannot get events: not connected to database")
+            return []
+        
+        session = self.Session()
+        try:
+            events = session.query(PacketEvent).filter(
+                PacketEvent.event_type == event_type
+            ).order_by(PacketEvent.timestamp.desc()).limit(limit).all()
+            
+            result = []
+            for event in events:
+                event_dict = {
+                    'id': event.id,
+                    'timestamp': event.timestamp.isoformat(),
+                    'stream_id': event.stream_id,
+                    'event_type': event.event_type,
+                    'sequence_number': event.sequence_number,
+                    'source_ip': event.source_ip,
+                    'destination_ip': event.destination_ip,
+                    'source_port': event.source_port,
+                    'destination_port': event.destination_port,
+                    'payload_size': event.payload_size,
+                    'metadata': json.loads(event.metadata) if event.metadata else None
+                }(),
+                    'stream_id': event.stream_id,
+                    'event_type': event.event_type,
+                    'sequence_number': event.sequence_number,
+                    'source_ip': event.source_ip,
+                    'destination_ip': event.destination_ip,
+                    'source_port': event.source_port,
+                    'destination_port': event.destination_port,
+                    'payload_size': event.payload_size,
+                    'metadata': json.loads(event.metadata) if event.metadata else None
+                }
+                result.append(event_dict)
+            
+            return result
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to get events: {e}")
+            return []
+        finally:
+            session.close()
+    
+    def get_stream_events(self, stream_id: str, limit: int = 100) -> List[Dict]:
+        """
+        Get events for a specific stream from the database.
+        
+        Args:
+            stream_id: Stream identifier
+            limit: Maximum number of records to return
+            
+        Returns:
+            List[Dict]: Events
+        """
+        if not self.engine or not self.Session:
+            logger.error("Cannot get stream events: not connected to database")
+            return []
+        
+        session = self.Session()
+        try:
+            events = session.query(PacketEvent).filter(
+                PacketEvent.stream_id == stream_id
+            ).order_by(PacketEvent.timestamp.desc()).limit(limit).all()
+            
+            result = []
+            for event in events:
+                event_dict = {
+                    'id': event.id,
+                    'timestamp': event.timestamp.isoformat(),
+                    'stream_id': event.stream_id,
+                    'event_type': event.event_type,
+                    'sequence_number': event.sequence_number,
+                    'source_ip': event.source_ip,
+                    'destination_ip': event.destination_ip,
+                    'source_port': event.source_port,
+                    'destination_port': event.destination_port,
+                    'payload_size': event.payload_size,
+                    'metadata': json.loads(event.metadata) if event.metadata else None
+                }
+                result.append(event_dict)
+            
+            return result
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to get stream events: {e}")
+            return []
+        finally:
+            session.close()
+    
+    def get_packet_loss_over_time(self, stream_id: Optional[str] = None, 
+                                  interval: str = 'hour', 
+                                  limit: int = 24) -> List[Dict]:
+        """
+        Get packet loss statistics over time.
+        
+        Args:
+            stream_id: Stream identifier or None for all streams
+            interval: Time interval ('minute', 'hour', 'day')
+            limit: Maximum number of intervals to return
+            
+        Returns:
+            List[Dict]: Packet loss statistics over time
+        """
+        if not self.engine or not self.Session:
+            logger.error("Cannot get packet loss stats: not connected to database")
+            return []
+        
+        session = self.Session()
+        try:
+            # Define the time grouping expression based on the interval
+            if interval == 'minute':
+                time_group = sa.func.strftime('%Y-%m-%d %H:%M', StreamStats.timestamp)
+            elif interval == 'hour':
+                time_group = sa.func.strftime('%Y-%m-%d %H', StreamStats.timestamp)
+            elif interval == 'day':
+                time_group = sa.func.strftime('%Y-%m-%d', StreamStats.timestamp)
+            else:
+                time_group = sa.func.strftime('%Y-%m-%d %H', StreamStats.timestamp)
+            
+            # Build the query
+            query = session.query(
+                time_group.label('interval'),
+                sa.func.avg(StreamStats.packet_loss_rate).label('avg_loss_rate'),
+                sa.func.sum(StreamStats.missing_packets).label('total_missing'),
+                sa.func.sum(StreamStats.injected_packets).label('total_injected'),
+                sa.func.sum(StreamStats.total_packets).label('total_packets')
+            ).group_by('interval').order_by(sa.desc('interval')).limit(limit)
+            
+            # Add stream_id filter if provided
+            if stream_id:
+                query = query.filter(StreamStats.stream_id == stream_id)
+            
+            # Execute the query
+            results = query.all()
+            
+            # Format the results
+            formatted_results = []
+            for row in results:
+                formatted_results.append({
+                    'interval': row.interval,
+                    'avg_loss_rate': float(row.avg_loss_rate) if row.avg_loss_rate is not None else 0.0,
+                    'total_missing': row.total_missing or 0,
+                    'total_injected': row.total_injected or 0,
+                    'total_packets': row.total_packets or 0,
+                    'recovery_rate': float(row.total_injected) / float(row.total_missing) if row.total_missing else 1.0
+                })
+            
+            return formatted_results
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to get packet loss stats: {e}")
+            return []
+        finally:
+            session.close()
+    
+    def close(self):
+        """Close the database connection."""
+        self.stop_auto_flush()
+        self.flush_events()  # Final flush
+        
+        if self.Session:
+            self.Session.remove()
+            
+        if self.engine:
+            self.engine.dispose()
+            logger.info("Closed database connection")

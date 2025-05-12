@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""
+packet_monitor.py - Main module for TCP packet monitoring and recovery
+
+This module integrates all components of the TCP packet recovery system into a
+unified interface for monitoring, analyzing, and recovering missing packets.
+"""
+
+import time
+import logging
+import signal
+import argparse
+import threading
+import json
+from typing import Dict, List, Optional, Any
+
+from .packet_capture import PacketCapture
+from .packet_analyzer import PacketAnalyzer
+from .knn_model import KNNModel
+from .packet_injector import PacketInjector
+from .event_logger import EventLogger
+from .visualizer import PacketVisualizer
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class PacketMonitor:
+    """Main class for TCP packet monitoring and recovery."""
+    
+    def __init__(self, 
+                interface: Optional[str] = None,
+                filter_str: str = "tcp",
+                buffer_size: int = 1000,
+                knn_model_path: Optional[str] = None,
+                db_url: str = "sqlite:///packet_events.db",
+                n_neighbors: int = 5,
+                confidence_threshold: float = 0.7,
+                visualization: bool = True,
+                visualization_host: str = "127.0.0.1",
+                visualization_port: int = 8050):
+        """
+        Initialize the packet monitor.
+        
+        Args:
+            interface: Network interface to capture packets from (None for all interfaces)
+            filter_str: BPF filter string to filter captured packets
+            buffer_size: Maximum number of packets to store in each stream buffer
+            knn_model_path: Path to saved KNN model or None to create a new one
+            db_url: SQLAlchemy database URL for event logging
+            n_neighbors: Number of neighbors to use in KNN model
+            confidence_threshold: Minimum confidence required for packet injection
+            visualization: Whether to enable visualization
+            visualization_host: Host address for visualization server
+            visualization_port: Port for visualization server
+        """
+        self.interface = interface
+        self.filter_str = filter_str
+        self.buffer_size = buffer_size
+        self.knn_model_path = knn_model_path
+        self.db_url = db_url
+        self.n_neighbors = n_neighbors
+        self.confidence_threshold = confidence_threshold
+        self.visualization_enabled = visualization
+        self.visualization_host = visualization_host
+        self.visualization_port = visualization_port
+        
+        # Initialize components
+        self.packet_capture = None
+        self.knn_model = None
+        self.packet_analyzer = None
+        self.packet_injector = None
+        self.event_logger = None
+        self.visualizer = None
+        
+        # State management
+        self.running = False
+        self.stop_event = threading.Event()
+        self.stats_thread = None
+        self.stats_update_interval = 5.0  # seconds
+    
+    def initialize_components(self):
+        """Initialize all components of the packet monitor."""
+        logger.info("Initializing packet monitor components...")
+        
+        # Initialize packet capture
+        self.packet_capture = PacketCapture(
+            interface=self.interface,
+            filter_str=self.filter_str,
+            buffer_size=self.buffer_size
+        )
+        
+        # Initialize KNN model
+        try:
+            if self.knn_model_path:
+                logger.info(f"Loading KNN model from {self.knn_model_path}")
+                self.knn_model = KNNModel.load_model(self.knn_model_path)
+            else:
+                logger.info("Creating new KNN model")
+                self.knn_model = KNNModel(n_neighbors=self.n_neighbors)
+        except Exception as e:
+            logger.error(f"Failed to initialize KNN model: {e}")
+            self.knn_model = None
+        
+        # Initialize packet analyzer
+        self.packet_analyzer = PacketAnalyzer(
+            packet_capture=self.packet_capture,
+            knn_model=self.knn_model
+        )
+        
+        # Initialize packet injector
+        if self.knn_model:
+            self.packet_injector = PacketInjector(
+                knn_model=self.knn_model,
+                confidence_threshold=self.confidence_threshold
+            )
+        else:
+            self.packet_injector = None
+            logger.warning("Packet injection disabled due to missing KNN model")
+        
+        # Initialize event logger
+        try:
+            self.event_logger = EventLogger(db_url=self.db_url)
+            self.event_logger.connect()
+        except Exception as e:
+            logger.error(f"Failed to initialize event logger: {e}")
+            self.event_logger = None
+        
+        # Initialize visualizer
+        if self.visualization_enabled:
+            try:
+                self.visualizer = PacketVisualizer(
+                    event_logger=self.event_logger,
+                    host=self.visualization_host,
+                    port=self.visualization_port
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize visualizer: {e}")
+                self.visualizer = None
+        
+        # Set up component connections
+        self._connect_components()
+        
+        logger.info("All components initialized")
+    
+    def _connect_components(self):
+        """Connect components together."""
+        if not all([self.packet_capture, self.packet_analyzer]):
+            logger.error("Cannot connect components: essential components missing")
+            return
+        
+        # Connect packet analyzer to packet capture
+        self.packet_capture.register_missing_seq_callback(
+            lambda stream_id, missing_seqs, packets: 
+                self.packet_analyzer.analyze_stream(stream_id, force=True)
+        )
+        
+        # Connect packet injector to packet analyzer
+        if self.packet_injector:
+            self.packet_analyzer.register_missing_packet_handler(
+                self.packet_injector.queue_packet_for_injection
+            )
+        
+        # Connect event logger to packet analyzer and injector
+        if self.event_logger:
+            # Log missing packet events
+            self.packet_analyzer.register_missing_packet_handler(
+                lambda stream_id, seq_num, prev_packet, next_packet:
+                    self.event_logger.log_event(
+                        event_type="missing_packet",
+                        stream_id=stream_id,
+                        sequence_number=seq_num,
+                        source_ip=prev_packet[IP].src if prev_packet and prev_packet.haslayer(IP) else None,
+                        destination_ip=prev_packet[IP].dst if prev_packet and prev_packet.haslayer(IP) else None,
+                        source_port=prev_packet[TCP].sport if prev_packet and prev_packet.haslayer(TCP) else None,
+                        destination_port=prev_packet[TCP].dport if prev_packet and prev_packet.haslayer(TCP) else None
+                    )
+            )
+            
+            # Log injection events
+            if self.packet_injector:
+                self.packet_injector.register_injection_callback(
+                    lambda stream_id, seq_num, packet:
+                        self.event_logger.log_event(
+                            event_type="packet_injection",
+                            stream_id=stream_id,
+                            sequence_number=seq_num,
+                            source_ip=packet[IP].src if packet and packet.haslayer(IP) else None,
+                            destination_ip=packet[IP].dst if packet and packet.haslayer(IP) else None,
+                            source_port=packet[TCP].sport if packet and packet.haslayer(TCP) else None,
+                            destination_port=packet[TCP].dport if packet and packet.haslayer(TCP) else None,
+                            payload_size=len(packet[Raw]) if packet and packet.haslayer(Raw) else 0
+                        )
+                )
+            
+            # Start auto-flush for event logger
+            self.event_logger.start_auto_flush()
+        
+        # Connect visualizer to data sources
+        if self.visualizer:
+            # Register callback to provide stream data
+            self.visualizer.register_data_callback(self._get_visualization_data)
+    
+    def _get_visualization_data(self) -> Dict[str, Any]:
+        """
+        Collect data for visualization.
+        
+        Returns:
+            Dict: Visualization data
+        """
+        data = {
+            'stream_ids': self.packet_capture.get_all_stream_ids(),
+            'stream_stats': {},
+            'packet_loss_history': [],
+            'event_history': []
+        }
+        
+        # Get analyzer statistics
+        analyzer_stats = self.packet_analyzer.get_missing_packet_statistics()
+        
+        # Get injector statistics
+        if self.packet_injector:
+            injector_stats = self.packet_injector.get_injection_statistics()
+        else:
+            injector_stats = {'total_injected_packets': 0, 'per_stream_stats': {}}
+        
+        # Combine statistics
+        total_streams = set(analyzer_stats['per_stream_stats'].keys()) | set(injector_stats.get('per_stream_stats', {}).keys())
+        for stream_id in total_streams:
+            analyzer_stream_stats = analyzer_stats['per_stream_stats'].get(stream_id, {})
+            injector_stream_stats = injector_stats.get('per_stream_stats', {}).get(stream_id, 0)
+            
+            total_packets = analyzer_stream_stats.get('total_packets', 0)
+            missing_packets = analyzer_stream_stats.get('missing_packets', 0)
+            
+            # Calculate statistics
+            packet_loss_rate = missing_packets / total_packets if total_packets > 0 else 0
+            
+            # Add to stream stats
+            data['stream_stats'][stream_id] = {
+                'total_packets': total_packets,
+                'missing_packets': missing_packets,
+                'injected_packets': injector_stream_stats,
+                'packet_loss_rate': packet_loss_rate,
+                'timestamp': datetime.datetime.now().isoformat()
+            }
+        
+        return data
+    
+    def _update_statistics(self):
+        """Update and log statistics periodically."""
+        while not self.stop_event.is_set():
+            try:
+                # Get analyzer statistics
+                analyzer_stats = self.packet_analyzer.get_missing_packet_statistics()
+                
+                # Get injector statistics
+                if self.packet_injector:
+                    injector_stats = self.packet_injector.get_injection_statistics()
+                else:
+                    injector_stats = {'total_injected_packets': 0, 'per_stream_stats': {}}
+                
+                # Log statistics for each stream
+                if self.event_logger:
+                    total_streams = set(analyzer_stats['per_stream_stats'].keys()) | set(injector_stats.get('per_stream_stats', {}).keys())
+                    
+                    for stream_id in total_streams:
+                        analyzer_stream_stats = analyzer_stats['per_stream_stats'].get(stream_id, {})
+                        injector_stream_stats = injector_stats.get('per_stream_stats', {}).get(stream_id, 0)
+                        
+                        total_packets = analyzer_stream_stats.get('total_packets', 0)
+                        missing_packets = analyzer_stream_stats.get('missing_packets', 0)
+                        
+                        # Log stream statistics
+                        self.event_logger.log_stream_stats(
+                            stream_id=stream_id,
+                            total_packets=total_packets,
+                            missing_packets=missing_packets,
+                            injected_packets=injector_stream_stats,
+                            packet_loss_rate=analyzer_stream_stats.get('packet_loss_rate', 0),
+                            average_payload_size=0.0,  # TODO: Calculate this
+                            metadata={
+                                'capture_interface': self.interface,
+                                'filter_string': self.filter_str
+                            }
+                        )
+            except Exception as e:
+                logger.error(f"Error updating statistics: {e}")
+            
+            # Wait for next update or until stopped
+            self.stop_event.wait(self.stats_update_interval)
+    
+    def start(self, training_time: float = 30.0, train_model: bool = True):
+        """
+        Start the packet monitor.
+        
+        Args:
+            training_time: Time to spend training the KNN model (in seconds)
+            train_model: Whether to train the KNN model before starting monitoring
+        """
+        if self.running:
+            logger.warning("Packet monitor is already running")
+            return
+        
+        # Initialize components if needed
+        if not self.packet_capture:
+            self.initialize_components()
+        
+        # Start packet capture
+        logger.info("Starting packet capture...")
+        self.packet_capture.start_capture()
+        
+        # Train the KNN model if needed
+        if train_model and self.knn_model and not self.knn_model.is_trained and not self.knn_model_path:
+            logger.info(f"Training KNN model for {training_time} seconds...")
+            
+            # Capture packets for the training period
+            time.sleep(training_time)
+            
+            # Collect packets from all streams
+            all_packets = []
+            for stream_id in self.packet_capture.get_all_stream_ids():
+                buffer = self.packet_capture.get_stream_buffer(stream_id)
+                if buffer:
+                    all_packets.extend(buffer.get_sorted_packets())
+            
+            # Train the model if we have enough packets
+            if len(all_packets) >= 10:
+                try:
+                    self.knn_model.train(all_packets)
+                    logger.info(f"KNN model trained with {len(all_packets)} packets")
+                    
+                    # Save the trained model if requested
+                    if self.knn_model_path:
+                        self.knn_model.save_model(self.knn_model_path)
+                        logger.info(f"KNN model saved to {self.knn_model_path}")
+                except Exception as e:
+                    logger.error(f"Failed to train KNN model: {e}")
+            else:
+                logger.warning(f"Not enough packets to train KNN model: {len(all_packets)} < 10")
+        
+        # Start packet analyzer
+        logger.info("Starting packet analyzer...")
+        self.packet_analyzer.start_analysis()
+        
+        # Start packet injector
+        if self.packet_injector and self.knn_model and self.knn_model.is_trained:
+            logger.info("Starting packet injector...")
+            self.packet_injector.start_injection()
+        else:
+            logger.warning("Packet injection not started: KNN model not trained")
+        
+        # Start visualizer
+        if self.visualizer:
+            logger.info("Starting visualization server...")
+            self.visualizer.start_visualization()
+            logger.info(f"Visualization available at http://{self.visualization_host}:{self.visualization_port}")
+        
+        # Start statistics thread
+        self.stop_event.clear()
+        self.stats_thread = threading.Thread(target=self._update_statistics)
+        self.stats_thread.daemon = True
+        self.stats_thread.start()
+        
+        self.running = True
+        logger.info("Packet monitor started")
+    
+    def stop(self):
+        """Stop the packet monitor."""
+        if not self.running:
+            logger.warning("Packet monitor is not running")
+            return
+        
+        logger.info("Stopping packet monitor...")
+        
+        # Signal the statistics thread to stop
+        self.stop_event.set()
+        if self.stats_thread:
+            self.stats_thread.join(timeout=2.0)
+        
+        # Stop components in reverse order
+        if self.visualizer:
+            logger.info("Stopping visualization server...")
+            self.visualizer.stop_visualization()
+        
+        if self.packet_injector:
+            logger.info("Stopping packet injector...")
+            self.packet_injector.stop_injection()
+        
+        if self.packet_analyzer:
+            logger.info("Stopping packet analyzer...")
+            self.packet_analyzer.stop_analysis()
+        
+        if self.packet_capture:
+            logger.info("Stopping packet capture...")
+            self.packet_capture.stop_capture()
+        
+        if self.event_logger:
+            logger.info("Stopping event logger...")
+            self.event_logger.close()
+        
+        self.running = False
+        logger.info("Packet monitor stopped")
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """
+        Get current statistics.
+        
+        Returns:
+            Dict: Current statistics
+        """
+        stats = {
+            'analyzer': {},
+            'injector': {},
+            'streams': {}
+        }
+        
+        # Get analyzer statistics
+        if self.packet_analyzer:
+            stats['analyzer'] = self.packet_analyzer.get_missing_packet_statistics()
+        
+        # Get injector statistics
+        if self.packet_injector:
+            stats['injector'] = self.packet_injector.get_injection_statistics()
+        
+        # Combine statistics for streams
+        if self.packet_analyzer and self.packet_injector:
+            analyzer_stats = stats['analyzer'].get('per_stream_stats', {})
+            injector_stats = stats['injector'].get('per_stream_stats', {})
+            
+            all_streams = set(analyzer_stats.keys()) | set(injector_stats.keys())
+            
+            for stream_id in all_streams:
+                stats['streams'][stream_id] = {
+                    'total_packets': analyzer_stats.get(stream_id, {}).get('total_packets', 0),
+                    'missing_packets': analyzer_stats.get(stream_id, {}).get('missing_packets', 0),
+                    'injected_packets': injector_stats.get(stream_id, 0),
+                    'packet_loss_rate': analyzer_stats.get(stream_id, {}).get('packet_loss_rate', 0)
+                }
+        
+        return stats
+
+def main():
+    """Command-line entry point."""
+    parser = argparse.ArgumentParser(description='TCP Packet Monitor')
+    parser.add_argument('-i', '--interface', help='Network interface to capture packets from')
+    parser.add_argument('-f', '--filter', default='tcp', help='BPF filter string')
+    parser.add_argument('-b', '--buffer-size', type=int, default=1000, help='Buffer size for each stream')
+    parser.add_argument('-m', '--model', help='Path to KNN model')
+    parser.add_argument('-d', '--database', default='sqlite:///packet_events.db', help='Database URL')
+    parser.add_argument('-k', '--knn-neighbors', type=int, default=5, help='Number of neighbors for KNN')
+    parser.add_argument('-c', '--confidence', type=float, default=0.7, help='Confidence threshold for injection')
+    parser.add_argument('-v', '--visualization', action='store_true', help='Enable visualization')
+    parser.add_argument('--viz-host', default='127.0.0.1', help='Visualization server host')
+    parser.add_argument('--viz-port', type=int, default=8050, help='Visualization server port')
+    parser.add_argument('-t', '--training-time', type=float, default=30.0, help='Training time in seconds')
+    parser.add_argument('--no-train', action='store_true', help='Skip model training')
+    
+    args = parser.parse_args()
+    
+    monitor = PacketMonitor(
+        interface=args.interface,
+        filter_str=args.filter,
+        buffer_size=args.buffer_size,
+        knn_model_path=args.model,
+        db_url=args.database,
+        n_neighbors=args.knn_neighbors,
+        confidence_threshold=args.confidence,
+        visualization=args.visualization,
+        visualization_host=args.viz_host,
+        visualization_port=args.viz_port
+    )
+    
+    # Set up signal handlers
+    def signal_handler(sig, frame):
+        logger.info("Received signal to stop")
+        monitor.stop()
+        # Include missing import at the top
+        import sys
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start the monitor
+    monitor.start(training_time=args.training_time, train_model=not args.no_train)
+    
+    # Keep the main thread alive
+    try:
+        while monitor.running:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt")
+        monitor.stop()
+
+if __name__ == '__main__':
+    main()

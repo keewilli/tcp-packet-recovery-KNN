@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""
+run_monitor.py - Script to run the TCP packet monitoring system
+
+This script provides a convenient way to start the TCP packet monitoring
+system with various configuration options.
+"""
+
+import os
+import sys
+import argparse
+import logging
+import configparser
+import time
+import signal
+
+# Ensure the package is in the Python path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from src.tcp_packet_recovery import PacketMonitor
+
+def setup_logging(level_name, log_file=None):
+    """Set up logging configuration."""
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    
+    if log_file:
+        logging.basicConfig(level=level, format=log_format,
+                           filename=log_file, filemode='a')
+        # Also log to console
+        console = logging.StreamHandler()
+        console.setLevel(level)
+        console.setFormatter(logging.Formatter(log_format))
+        logging.getLogger('').addHandler(console)
+    else:
+        logging.basicConfig(level=level, format=log_format)
+    
+    # Set scapy logging level higher to reduce verbosity
+    logging.getLogger('scapy.runtime').setLevel(logging.ERROR)
+
+def load_config(config_file):
+    """Load configuration from a file."""
+    config = configparser.ConfigParser()
+    
+    if not os.path.exists(config_file):
+        print(f"Config file not found: {config_file}")
+        return None
+    
+    config.read(config_file)
+    return config
+
+def main():
+    """Main function."""
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='TCP Packet Monitor')
+    parser.add_argument('-c', '--config', default='config/config.ini',
+                       help='Path to configuration file')
+    parser.add_argument('-i', '--interface', help='Network interface to capture packets from')
+    parser.add_argument('-f', '--filter', help='BPF filter string')
+    parser.add_argument('-b', '--buffer-size', type=int, help='Buffer size for each stream')
+    parser.add_argument('-m', '--model', help='Path to KNN model')
+    parser.add_argument('-d', '--database', help='Database URL')
+    parser.add_argument('-k', '--knn-neighbors', type=int, help='Number of neighbors for KNN')
+    parser.add_argument('-t', '--confidence', type=float, help='Confidence threshold for injection')
+    parser.add_argument('-v', '--visualization', action='store_true', help='Enable visualization')
+    parser.add_argument('--viz-host', help='Visualization server host')
+    parser.add_argument('--viz-port', type=int, help='Visualization server port')
+    parser.add_argument('--training-time', type=float, help='Training time in seconds')
+    parser.add_argument('--no-train', action='store_true', help='Skip model training')
+    parser.add_argument('--log-level', help='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
+    parser.add_argument('--log-file', help='Path to log file')
+    parser.add_argument('--duration', type=int, help='Duration to run in seconds (0 for indefinite)')
+    
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = load_config(args.config)
+    
+    # Set up logging
+    log_level = args.log_level or (config and config.get('logging', 'level', fallback='INFO')) or 'INFO'
+    log_file = args.log_file or (config and config.get('logging', 'file', fallback=None))
+    setup_logging(log_level, log_file)
+    
+    logger = logging.getLogger('tcp_monitor')
+    
+    # Get configuration values
+    interface = args.interface or (config and config.get('capture', 'interface', fallback=None))
+    filter_str = args.filter or (config and config.get('capture', 'filter', fallback='tcp'))
+    buffer_size = args.buffer_size or (config and config.getint('capture', 'buffer_size', fallback=1000))
+    model_path = args.model or (config and config.get('knn', 'model_path', fallback=None))
+    db_url = args.database or (config and config.get('database', 'url', fallback='sqlite:///packet_events.db'))
+    n_neighbors = args.knn_neighbors or (config and config.getint('knn', 'n_neighbors', fallback=5))
+    confidence = args.confidence or (config and config.getfloat('injection', 'confidence_threshold', fallback=0.7))
+    visualization = args.visualization or (config and config.getboolean('visualization', 'enabled', fallback=True))
+    viz_host = args.viz_host or (config and config.get('visualization', 'host', fallback='127.0.0.1'))
+    viz_port = args.viz_port or (config and config.getint('visualization', 'port', fallback=8050))
+    training_time = args.training_time or (config and config.getfloat('knn', 'training_time', fallback=30.0))
+    train_model = not args.no_train
+    duration = args.duration or (config and config.getint('general', 'duration', fallback=0))
+    
+    # Create packet monitor
+    logger.info("Creating TCP packet monitor...")
+    monitor = PacketMonitor(
+        interface=interface,
+        filter_str=filter_str,
+        buffer_size=buffer_size,
+        knn_model_path=model_path,
+        db_url=db_url,
+        n_neighbors=n_neighbors,
+        confidence_threshold=confidence,
+        visualization=visualization,
+        visualization_host=viz_host,
+        visualization_port=viz_port
+    )
+    
+    # Set up signal handlers for graceful shutdown
+    def signal_handler(sig, frame):
+        logger.info("Received signal to stop")
+        monitor.stop()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        # Start the monitor
+        logger.info("Starting TCP packet monitor...")
+        monitor.start(training_time=training_time, train_model=train_model)
+        
+        # Display information
+        if visualization:
+            logger.info(f"Visualization dashboard available at http://{viz_host}:{viz_port}")
+        
+        # Run for the specified duration or indefinitely
+        if duration > 0:
+            logger.info(f"Running for {duration} seconds...")
+            time.sleep(duration)
+            monitor.stop()
+        else:
+            logger.info("Running indefinitely. Press Ctrl+C to stop.")
+            while monitor.running:
+                time.sleep(1)
+        
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        monitor.stop()
+    except Exception as e:
+        logger.error(f"Error running packet monitor: {e}", exc_info=True)
+        monitor.stop()
+    
+    logger.info("TCP packet monitor stopped")
+
+if __name__ == '__main__':
+    main()

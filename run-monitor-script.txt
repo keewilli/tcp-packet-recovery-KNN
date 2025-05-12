@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""
+run_monitor.py - Script to run the TCP packet monitoring system
+
+This script provides a convenient way to start the TCP packet monitoring
+system with various configuration options.
+"""
+
+import os
+import sys
+import argparse
+import logging
+import configparser
+import time
+import signal
+
+# Ensure the package is in the Python path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from src.tcp_packet_recovery import PacketMonitor
+
+def setup_logging(level_name, log_file=None):
+    """Set up logging configuration."""
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    
+    if log_file:
+        logging.basicConfig(level=level, format=log_format,
+                           filename=log_file, filemode='a')
+        # Also log to console
+        console = logging.StreamHandler()
+        console.setLevel(level)
+        console.setFormatter(logging.Formatter(log_format))
+        logging.getLogger('').addHandler(console)
+    else:
+        logging.basicConfig(level=level, format=log_format)
+    
+    # Set scapy logging level higher to

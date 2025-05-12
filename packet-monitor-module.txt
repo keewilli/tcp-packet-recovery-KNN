@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""
+packet_monitor.py - Main module for TCP packet monitoring and recovery
+
+This module integrates all components of the TCP packet recovery system into a
+unified interface for monitoring, analyzing, and recovering missing packets.
+"""
+
+import time
+import logging
+import signal
+import argparse
+import threading
+import json
+from typing import Dict, List, Optional, Any
+
+from .packet_capture import PacketCapture
+from .packet_analyzer import PacketAnalyzer
+from .knn_model import KNNModel
+from .packet_injector import PacketInjector
+from .event_logger import EventLogger
+from .visualizer import PacketVisualizer
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class PacketMonitor:
+    """Main class for TCP packet monitoring and recovery."""
+    
+    def __init__(self, 
+                interface: Optional[str] = None,
+                filter_str: str = "tcp",
+                buffer_size: int = 1000,
+                knn_model_path: Optional[str] = None,
+                db_url: str = "sqlite:///packet_events.db",
+                n_neighbors: int = 5,
+                confidence_threshold: float = 0.7,
+                visualization: bool = True,
+                visualization_host: str = "127.0.0.1",
+                visualization_port: int = 8050):
+        """
+        Initialize the packet monitor.
+        
+        Args:
+            interface: Network interface to capture packets from (None for all interfaces)
+            filter_str: BPF filter string to filter captured packets
+            buffer_size: Maximum number of packets to store in each stream buffer
+            knn_model_path: Path to saved KNN model or None to create a new one
+            db_url: SQLAlchemy database URL for event logging
+            n_neighbors: Number of neighbors to use in KNN model
+            confidence_threshold: Minimum confidence required for packet injection
+            visualization: Whether to enable visualization
+            visualization_host: Host address for visualization server
+            visualization_port: Port for visualization server
+        """
+        self.interface = interface
+        self.filter_str = filter_str
+        self.buffer_size = buffer_size
+        self.knn_model_path = knn_model_path
+        self.db_url = db_url
+        self.n_neighbors = n_neighbors
+        self.confidence_threshold = confidence_threshold
+        self.visualization_enabled = visualization
+        self.visualization_host = visualization_host
+        self.visualization_port = visualization_port
+        
+        # Initialize components
+        self.packet_capture = None
+        self.knn_model = None
+        self.packet_analyzer = None
+        self.packet_injector = None
+        self.event_logger = None
+        self.visualizer = None
+        
+        # State management
+        self.running = False
+        self.stop_event = threading.Event()
+        self.stats_thread = None
+        self.stats_update_interval = 5.0  # seconds
+    
+    def initialize_components(self):
+        """Initialize all components of the packet monitor."""
+        logger.info("Initializing packet monitor components...")
+        
+        # Initialize packet capture
+        self.packet_capture = PacketCapture(
+            interface=self.interface,
+            filter_str=self.filter_str,
+            buffer_size=self.buffer_size
+        )
+        
+        # Initialize KNN model
+        try:
+            if self.knn_model_path:
+                logger.info(f"Loading KNN model from {self.knn_model_path}")
+                self.knn_model = KNNModel.load_model(self.knn_model_path)
+            else:
+                logger.info("Creating new KNN model")
+                self.knn_model = KNNModel(n_neighbors=self.n_neighbors)
+        except Exception as e:
+            logger.error(f"Failed to initialize KNN model: {e}")
+            self.knn_model = None
+        
+        # Initialize packet analyzer
+        self.packet_analyzer = PacketAnalyzer(
+            packet_capture=self.packet_capture,
+            knn_model=self.knn_model
+        )
+        
+        # Initialize packet injector
+        if self.knn_model:
+            self.packet_injector = PacketInjector(
+                knn_model=self.knn_model,
+                confidence_threshold=self.confidence_threshold
+            )
+        else:
+            self.packet_injector = None
+            logger.warning("Packet injection disabled due to missing KNN model")
+        
+        # Initialize event logger
+        try:
+            self.event_logger = EventLogger(db_url=self.db_url)
+            self.event_logger.connect()
+        except Exception as e:
+            logger.error(f"Failed to initialize event logger: {e}")
+            self.event_logger = None
+        
+        # Initialize visualizer
+        if self.visualization_enabled:
+            try:
+                self.visualizer = PacketVisualizer(
+                    event_logger=self.event_logger,
+                    host=self.visualization_host,
+                    port=self.visualization_port
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize visualizer: {e}")
+                self.visualizer = None
+        
+        # Set up component connections
+        self._connect_components()
+        
+        logger.info("All components initialized")
+    
+    def _connect_components(self):
+        """Connect components together."""
+        if not all([self.packet_capture, self.packet_analyzer]):
+            logger.error("Cannot connect components: essential components missing")
+            return
+        
+        # Connect packet analyzer to packet capture
+        self.packet_capture.register_missing_seq_callback(
+            lambda stream_id, missing_seqs, packets: 
+                self.packet_analyzer.analyze_stream(stream_id, force=True)
+        )
+        
+        # Connect packet injector to packet analyzer
+        if self.packet_injector:
+            self.packet_analyzer.register_missing_packet_handler(
+                self.packet_injector.queue_packet_for_injection
+            )
+        
+        # Connect event logger to packet analyzer and injector
+        if self.event_logger:
+            # Log missing packet events
+            self.packet_analyzer.register_missing_packet_handler(
+                lambda stream_id, seq_num, prev_packet, next_packet:
+                    self.event_logger.log_event(
+                        event_type="missing_packet",
+                        stream_id=stream_id,
+                        sequence_number=seq_num,
+                        source_ip=prev_packet[IP].src if prev_packet and prev_packet.haslayer(IP) else None,
+                        destination_ip=prev_packet[IP].dst if prev_packet and prev_packet.haslayer(IP) else None,
+                        source_port=prev_packet[TCP].sport if prev_packet and prev_packet.haslayer(TCP) else None,
+                        destination_port=prev_packet[TCP].dport if prev_packet and prev_packet.haslayer(TCP) else None
+                    )
+            )
+            
+            # Log injection events
+            if self.packet_injector:
+                self.packet_injector.register_injection_callback(
+                    lambda stream_id, seq_num, packet:
+                        self.event_logger.log_event(
+                            event_type="packet_injection",
+                            stream_id=stream_id,
+                            sequence_number=seq_num,
+                            source_ip=

@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+custom_visualization.py - Example of customizing the visualization dashboard
+
+This example demonstrates how to create a custom visualization dashboard
+for TCP packet statistics using the TCP Packet Recovery package.
+"""
+
+import time
+import logging
+import threading
+import argparse
+import dash
+from dash import dcc, html
+import dash_bootstrap_components as dbc
+from dash.dependencies import Input, Output
+import plotly.graph_objs as go
+import numpy as np
+import pandas as pd
+
+from tcp_packet_recovery import PacketCapture, PacketAnalyzer, EventLogger
+from tcp_packet_recovery.visualizer import PacketVisualizer
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class CustomVisualizer(PacketVisualizer):
+    """Custom packet visualizer with additional features."""
+    
+    def create_app(self):
+        """Create a custom Dash app for visualization."""
+        app = dash.Dash(__name__, 
+                       external_stylesheets=[dbc.themes.CYBORG],  # Use a dark theme
+                       suppress_callback_exceptions=True)
+        
+        # Define the layout with custom components
+        app.layout = html.Div([
+            dbc.NavbarSimple(
+                children=[
+                    dbc.NavItem(dbc.NavLink("Dashboard", href="#")),
+                    dbc.DropdownMenu(
+                        id='stream-dropdown',
+                        children=[
+                            dbc.DropdownMenuItem("Loading streams...", id="loading-streams")
+                        ],
+                        nav=True,
+                        in_navbar=True,
+                        label="Select Stream",
+                    ),
+                ],
+                brand="Custom TCP Monitor Dashboard",
+                brand_href="#",
+                color="success",  # Green color for the navbar
+                dark=True,
+            ),
+            dbc.Container([
+                html.Div(id='hidden-div', style={'display': 'none'}),
+                dcc.Interval(
+                    id='interval-component',
+                    interval=int(self.update_interval * 1000),  # in milliseconds
+                    n_intervals=0
+                ),
+                # Add a header row with real-time summary statistics
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("Monitor Summary", className="text-center"),
+                            dbc.CardBody([
+                                html.Div(id='summary-stats', className="text-center")
+                            ])
+                        ], className="mb-4"),
+                    ], width=12),
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("Stream Statistics"),
+                            dbc.CardBody([
+                                html.Div(id='stream-stats')
+                            ])
+                        ], className="mb-4"),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("Packet Distribution"),
+                            dbc.CardBody([
+                                dcc.Graph(id='packet-distribution-graph')
+                            ])
+                        ], className="mb-4"),
+                    ], width=6),
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("Packet Loss Over Time"),
+                            dbc.CardBody([
+                                dcc.Graph(id='packet-loss-graph')
+                            ])
+                        ], className="mb-4"),
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("Recovery Rate"),
+                            dbc.CardBody([
+                                dcc.Graph(id='recovery-rate-graph')
+                            ])
+                        ], className="mb-4"),
+                    ], width=6),
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("Recent Events"),
+                            dbc.CardBody([
+                                html.Div(id='event-table')
+                            ])
+                        ], className="mb-4"),
+                    ], width=12),
+                ]),
+            ], fluid=True),
+        ])
+        
+        # Define callbacks
+        @app.callback(
+            [Output('stream-dropdown', 'children'),
+             Output('summary-stats', 'children'),
+             Output('stream-stats', 'children'),
+             Output('packet-distribution-graph', 'figure'),
+             Output('packet-loss-graph', 'figure'),
+             Output('recovery-rate-graph', 'figure'),
+             Output('event-table', 'children')],
+            [Input('interval-component', 'n_intervals'),
+             Input('stream-dropdown', 'value')]
+        )
+        def update_visualizations(n_intervals, stream_id):
+            # Get the stream ID from callback context if available
+            ctx = dash.callback_context
+            if ctx.triggered:
+                input_id = ctx.triggered[0]['prop_id'].

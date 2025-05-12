@@ -1,0 +1,132 @@
+# TCP Packet Recovery Using KNN
+
+A Python framework for detecting, logging, and recovering missing packets in TCP connection streams using K-Nearest Neighbors machine learning algorithm.
+
+## Project Overview
+
+This project provides a solution for real-time TCP packet loss detection and recovery using the K-Nearest Neighbors (KNN) algorithm. The system identifies patterns in network traffic to predict and inject missing packets, while simultaneously logging events to a database and visualizing packet loss statistics in real-time.
+
+## Features
+
+- Real-time monitoring of TCP streams
+- KNN-based packet loss prediction and recovery
+- Database logging of missing packet events
+- Real-time visualization of packet loss statistics
+- Modular architecture for easy extensibility
+
+## Project Structure
+
+```
+tcp-packet-recovery/
+├── src/
+│   ├── __init__.py
+│   ├── packet_capture.py        # Packet capture and stream reconstruction
+│   ├── packet_analyzer.py       # Packet analysis and missing packet detection
+│   ├── knn_model.py             # KNN implementation for packet prediction
+│   ├── packet_injector.py       # Missing packet injection logic
+│   ├── event_logger.py          # Database logging functionality
+│   └── visualizer.py            # Real-time visualization components
+├── config/
+│   └── config.ini               # Configuration settings
+├── scripts/
+│   ├── run_monitor.py           # Main script to run the monitoring system
+│   ├── train_model.py           # Script to train the KNN model
+│   └── test_injection.py        # Test script for packet injection
+├── examples/
+│   ├── basic_monitoring.py      # Example of basic stream monitoring
+│   ├── custom_visualization.py  # Example of customizing visualization
+│   └── advanced_recovery.py     # Example of advanced recovery settings
+├── tests/
+│   ├── __init__.py
+│   ├── test_packet_capture.py   # Unit tests for packet capture
+│   ├── test_knn_model.py        # Unit tests for KNN implementation
+│   ├── test_packet_injector.py  # Unit tests for packet injection
+│   └── test_event_logger.py     # Unit tests for event logging
+├── docs/
+│   ├── installation.md          # Installation instructions
+│   ├── usage.md                 # Usage documentation
+│   └── api.md                   # API documentation
+├── requirements.txt             # Project dependencies
+├── setup.py                     # Package installation script
+├── .gitignore                   # Git ignore file
+└── README.md                    # Project README
+```
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/tcp-packet-recovery.git
+cd tcp-packet-recovery
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install the package in development mode
+pip install -e .
+```
+
+## Requirements
+
+- Python 3.8+
+- scapy
+- numpy
+- pandas
+- scikit-learn
+- matplotlib
+- dash (for real-time visualization)
+- sqlalchemy (for database operations)
+- psutil (for system monitoring)
+
+## Usage
+
+### Basic Usage
+
+```python
+from tcp_packet_recovery import PacketMonitor
+
+# Initialize the packet monitor
+monitor = PacketMonitor(interface="eth0")
+
+# Start monitoring with default settings
+monitor.start()
+
+# Stop monitoring
+monitor.stop()
+```
+
+### Advanced Configuration
+
+```python
+from tcp_packet_recovery import PacketMonitor, KNNModel, DatabaseLogger
+
+# Configure KNN model
+knn_model = KNNModel(n_neighbors=5, weights='distance')
+
+# Configure database logger
+db_logger = DatabaseLogger(db_url="sqlite:///packet_events.db")
+
+# Initialize packet monitor with custom components
+monitor = PacketMonitor(
+    interface="eth0",
+    model=knn_model,
+    logger=db_logger,
+    buffer_size=1000,
+    recovery_threshold=0.8
+)
+
+# Start monitoring with custom settings
+monitor.start(visualization=True, log_level="INFO")
+```
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request

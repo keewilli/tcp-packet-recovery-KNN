@@ -1,0 +1,49 @@
+[general]
+# Duration to run in seconds (0 for indefinite)
+duration = 0
+
+[capture]
+# Network interface to capture packets from (empty for all interfaces)
+interface = 
+# BPF filter string to filter captured packets
+filter = tcp
+# Maximum number of packets to store in each stream buffer
+buffer_size = 1000
+
+[knn]
+# Number of neighbors to use in KNN
+n_neighbors = 5
+# Weight function used in prediction ('uniform' or 'distance')
+weights = distance
+# Path to saved KNN model (empty to create a new one)
+model_path = 
+# Training time in seconds
+training_time = 30.0
+
+[injection]
+# Minimum confidence required for packet injection (0.0-1.0)
+confidence_threshold = 0.7
+# Whether to enable packet injection
+enabled = true
+
+[database]
+# SQLAlchemy database URL for event logging
+url = sqlite:///packet_events.db
+# How often to automatically flush events (in seconds)
+auto_flush_interval = 5.0
+
+[visualization]
+# Whether to enable visualization
+enabled = true
+# Host address for visualization server
+host = 127.0.0.1
+# Port for visualization server
+port = 8050
+# How often to update visualizations (in seconds)
+update_interval = 1.0
+
+[logging]
+# Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+level = INFO
+# Path to log file (empty for console logging only)
+file = 
